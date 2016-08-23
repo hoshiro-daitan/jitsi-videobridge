@@ -266,7 +266,7 @@ public class LipSyncHack
 
         acceptedVideoSSRCs.add(acceptedVideoSSRC);
 
-        VideoChannel targetVC = (VideoChannel) target;
+        final VideoChannel targetVC = (VideoChannel) target;
         InjectState state;
         synchronized (states)
         {
@@ -324,7 +324,15 @@ public class LipSyncHack
                 long timestampDelta =
                     (lastTimestampDropped - highestTimestampSent) & 0xffffffffl;
 
-                rewriter = new ResumableStreamRewriter(
+                    rewriter = new ResumableStreamRewriter(
+                        new ResumableStreamRewriter.Owner()
+                        {
+                            @Override
+                            public MediaStream getMediaStream()
+                            {
+                                return targetVC.getStream();
+                            }
+                        },
                     highestSeqnumSent, seqnumDelta,
                     highestTimestampSent, timestampDelta);
 
