@@ -15,7 +15,9 @@
  */
 package org.jitsi.videobridge;
 
+import net.sf.fmj.media.rtp.*;
 import org.jitsi.impl.neomedia.*;
+import org.jitsi.impl.neomedia.rtcp.*;
 import org.jitsi.impl.neomedia.rtp.*;
 import org.jitsi.service.neomedia.*;
 import org.jitsi.util.*;
@@ -73,7 +75,7 @@ public class LipSyncHack
     /**
      * Wait for media for WAIT_MS before sending frames.
      */
-    private static final long WAIT_MS = 1000;
+    private static final long WAIT_MS = 2000;
 
     /**
      * The <tt>Logger</tt> used by the <tt>LipSyncHack</tt> class and
@@ -116,7 +118,14 @@ public class LipSyncHack
      * The remote video SSRCs that have been accepted by the translator and
      * forwarded to the endpoint associated to this instance.
      */
-    private final List<Long> acceptedVideoSSRCs = new ArrayList<>();
+    private final List<Long> acceptedVideoSSRCsRTCP = new ArrayList<>();
+
+
+    /**
+     * The remote video SSRCs that have been accepted by the translator and
+     * forwarded to the endpoint associated to this instance.
+     */
+    private final List<Long> acceptedVideoSSRCsRTP = new ArrayList<>();
 
     /**
      * A map that holds all the inject states.
@@ -205,26 +214,26 @@ public class LipSyncHack
         // audio channel will never reach this.
         acceptedAudioSSRCs.add(acceptedAudioSSRC);
 
-        // FIXME this will include rtx ssrcs and whatnot.
-        for (int ssrc : sourceVC.getReceiveSSRCs())
+        // FIXME this is a little ugly
+        Long receiveVideoSSRC = sourceVC.getTransformEngine()
+            .getSimulcastEngine().getSimulcastReceiver()
+            .getSimulcastStream(0).getPrimarySSRC();
+
+        synchronized (states)
         {
-            Long receiveVideoSSRC = ssrc & 0xffffffffl;
-            synchronized (states)
+            if (states.containsKey(receiveVideoSSRC))
             {
-                if (states.containsKey(receiveVideoSSRC))
-                {
-                    // This receive video SSRC has already been processed.
-                    continue;
-                }
-
-                InjectState injectState = new InjectState(
-                    receiveVideoSSRC, targetVC.getStream(), true);
-
-                states.put(receiveVideoSSRC, injectState);
-
-                InjectTask injectTask = new InjectTask(injectState);
-                injectTask.schedule();
+                // This receive video SSRC has already been processed.
+                return;
             }
+
+            InjectState injectState = new InjectState(
+                receiveVideoSSRC, targetVC.getStream(), true);
+
+            states.put(receiveVideoSSRC, injectState);
+
+            InjectTask injectTask = new InjectTask(injectState);
+            injectTask.schedule();
         }
     }
 
@@ -233,38 +242,84 @@ public class LipSyncHack
      * written.
      *
      * @param data true if the buffer holds an RTP packet, false otherwise.
-     * @param buffer the buffer which contains the bytes of the received RTP or
+     * @param buf the buffer which contains the bytes of the received RTP or
      * RTCP packet.
-     * @param offset the zero-based index in <tt>buffer</tt> at which the bytes
+     * @param off the zero-based index in <tt>buffer</tt> at which the bytes
      * of the received RTP or RTCP packet begin.
-     * @param length the number of bytes in <tt>buffer</tt> beginning at
+     * @param len the number of bytes in <tt>buffer</tt> beginning at
      * <tt>offset</tt> which represent the received RTP or RTCP packet.
      * @param target the {@link Channel} where this packet is going.
      */
     public void onRTPTranslatorWillWriteVideo(
-        boolean accept, boolean data, byte[] buffer,
-        int offset, int length, Channel target)
+        boolean accept, boolean data, byte[] buf,
+        int off, int len, Channel target)
     {
-        if (!accept || !data)
+        if (!accept)
         {
             return;
         }
 
-        Long acceptedVideoSSRC
-            = RawPacket.getSSRCAsLong(buffer, offset, length);
+        if (data)
+        {
+            long acceptedVideoSSRC
+                = RawPacket.getSSRCAsLong(buf, off, len);
 
+            long timestamp
+                = RawPacket.getTimestamp(buf, off, len);
+
+            int seqnum
+                = RawPacket.getSequenceNumber(buf, off, len);
+
+            onRTPTranslatorWillWriteVideoRTP(acceptedVideoSSRC, timestamp, seqnum, target);
+        }
+        else
+        {
+            int offset = off, length = len;
+
+            while (length > 0)
+            {
+                // Check RTCP packet validity. This makes sure that pktLen > 0
+                // so this loop will eventually terminate.
+                if (!RTCPHeaderUtils.isValid(buf, offset, length))
+                {
+                    break;
+                }
+
+                int pktLen = RTCPHeaderUtils.getLength(buf, offset, length);
+
+                int pt = RTCPHeaderUtils.getPacketType(buf, offset, pktLen);
+                if (pt == RTCPPacket.SR)
+                {
+                    long acceptedVideoSSRC
+                        = RTCPHeaderUtils.getSenderSSRC(buf, offset, pktLen);
+
+                    long timestamp = RTCPSenderInfoUtils.getTimestamp(
+                        buf, offset + RTCPHeader.SIZE, pktLen - RTCPHeader.SIZE);
+
+                    onRTPTranslatorWillWriteVideoRTCP(acceptedVideoSSRC, timestamp, target);
+                }
+
+                offset += pktLen;
+                length -= pktLen;
+            }
+        }
+    }
+
+    private void onRTPTranslatorWillWriteVideoRTP(
+        long acceptedVideoSSRC, long timestamp, int seqnum, Channel target)
+    {
         // In order to minimize the synchronization overhead, we process
         // only the first data packet of a given RTP stream.
         //
         // XXX No synchronization is required to r/w the acceptedVideoSSRCs
         // because in the current architecture this method is called by a single
         // thread at the time.
-        if (acceptedVideoSSRCs.contains(acceptedVideoSSRC))
+        if (acceptedVideoSSRCsRTP.contains(acceptedVideoSSRC))
         {
             return;
         }
 
-        acceptedVideoSSRCs.add(acceptedVideoSSRC);
+        acceptedVideoSSRCsRTP.add(acceptedVideoSSRC);
 
         final VideoChannel targetVC = (VideoChannel) target;
         InjectState state;
@@ -297,53 +352,107 @@ public class LipSyncHack
                 = targetVC.getStream().getStreamRTPManager();
 
             ResumableStreamRewriter rewriter = streamRTPManager
-                .getResumableStreamRewriter(acceptedVideoSSRC, false);
+                .getResumableStreamRewriter(acceptedVideoSSRC);
 
-            if (rewriter == null)
+            // Pretend we have dropped all the packets prior to the one
+            // that's about to be written by the translator.
+            int highestSeqnumSent = state.getNextSequenceNumber();
+
+            // Timestamps are calculated.
+            long highestTimestampSent = state.getNextTimestamp();
+
+            // Pretend we have dropped all the packets prior to the one
+            // that's about to be written by the translator.
+            int lastSeqnumDropped = RTPUtils.subtractNumber(seqnum, 1);
+            int seqnumDelta = RTPUtils.subtractNumber(
+                lastSeqnumDropped, highestSeqnumSent);
+
+            long lastTimestampDropped
+                = (timestamp - TS_INCREMENT_PER_FRAME) & 0xffffffffl;
+            long timestampDelta =
+                (lastTimestampDropped - highestTimestampSent) & 0xffffffffl;
+
+            rewriter.setHighestSequenceNumberSent(highestSeqnumSent);
+
+            if (rewriter.getHighestTimestampSent() != -1)
             {
-                int seqnum
-                    = RawPacket.getSequenceNumber(buffer, offset, length);
-
-                // Pretend we have dropped all the packets prior to the one
-                // that's about to be written by the translator.
-                int lastSeqnumDropped = RTPUtils.subtractNumber(seqnum, 1);
-                int highestSeqnumSent = state.getNextSequenceNumber();
-                int seqnumDelta = RTPUtils.subtractNumber(
-                    lastSeqnumDropped, highestSeqnumSent);
-
-                long timestamp
-                    = RawPacket.getTimestamp(buffer, offset, length);
-
-                // Timestamps are calculated.
-                long highestTimestampSent = state.getNextTimestamp();
-
-                // Pretend we have dropped all the packets prior to the one
-                // that's about to be written by the translator.
-                long lastTimestampDropped
-                    = (timestamp - TS_INCREMENT_PER_FRAME) & 0xffffffffl;
-                long timestampDelta =
-                    (lastTimestampDropped - highestTimestampSent) & 0xffffffffl;
-
-                    rewriter = new ResumableStreamRewriter(
-                        new ResumableStreamRewriter.Owner()
-                        {
-                            @Override
-                            public MediaStream getMediaStream()
-                            {
-                                return targetVC.getStream();
-                            }
-                        },
-                    highestSeqnumSent, seqnumDelta,
-                    highestTimestampSent, timestampDelta);
-
-                streamRTPManager
-                    .putResumableStreamRewriter(acceptedVideoSSRC, rewriter);
+                rewriter.setHighestTimestampSent(highestTimestampSent);
             }
-            else
+            if (rewriter.getTimestampDelta() != -1)
             {
-                logger.warn("Could not initialize a sequence number rewriter" +
-                    "because one is already there.");
+                rewriter.setTimestampDelta(timestampDelta);
             }
+
+            rewriter.setSeqnumDelta(seqnumDelta);
+        }
+    }
+
+    private void onRTPTranslatorWillWriteVideoRTCP(
+        long acceptedVideoSSRC, long timestamp, Channel target)
+    {
+        // In order to minimize the synchronization overhead, we process
+        // only the first data packet of a given RTP stream.
+        //
+        // XXX No synchronization is required to r/w the acceptedVideoSSRCs
+        // because in the current architecture this method is called by a single
+        // thread at the time.
+        if (acceptedVideoSSRCsRTCP.contains(acceptedVideoSSRC))
+        {
+            return;
+        }
+
+        acceptedVideoSSRCsRTCP.add(acceptedVideoSSRC);
+
+        final VideoChannel targetVC = (VideoChannel) target;
+        InjectState state;
+        synchronized (states)
+        {
+            state = states.get(acceptedVideoSSRC);
+            if (state == null)
+            {
+                // The hack has never been triggered for this stream.
+                states.put(acceptedVideoSSRC, new InjectState(acceptedVideoSSRC,
+                    targetVC.getStream(), false));
+
+                return;
+            }
+        }
+
+        synchronized (state)
+        {
+            // If we reached this point => state.active = true.
+            state.active = false;
+
+            if (state.numOfKeyframesSent == 0)
+            {
+                // No key frames have been sent for this SSRC => No need to
+                // rewrite anything.
+                return;
+            }
+
+            StreamRTPManager streamRTPManager
+                = targetVC.getStream().getStreamRTPManager();
+
+            ResumableStreamRewriter rewriter = streamRTPManager
+                .getResumableStreamRewriter(acceptedVideoSSRC);
+
+            // Pretend we have dropped all the packets prior to the one
+            // that's about to be written by the translator.
+            int highestSeqnumSent = state.getNextSequenceNumber();
+
+            // Timestamps are calculated.
+            long highestTimestampSent = state.getNextTimestamp();
+
+            // Pretend we have dropped all the packets prior to the one
+            // that's about to be written by the translator.
+            long lastTimestampDropped
+                = (timestamp - TS_INCREMENT_PER_FRAME) & 0xffffffffl;
+            long timestampDelta =
+                (lastTimestampDropped - highestTimestampSent) & 0xffffffffl;
+
+            rewriter.setHighestSequenceNumberSent(highestSeqnumSent);
+            rewriter.setHighestTimestampSent(highestTimestampSent);
+            rewriter.setTimestampDelta(timestampDelta);
         }
 
     }
@@ -422,8 +531,9 @@ public class LipSyncHack
                     {
                         logger.debug("Injecting black key frame ssrc="
                             + injectState.ssrc + ", seqnum="
-                            + injectState.numOfKeyframesSent + ", timestamp="
-                            + timestamp);
+                            + seqnum + ", timestamp="
+                            + timestamp + ", streamHashCode="
+                            + mediaStream.hashCode());
                     }
 
                     mediaStream.injectPacket(keyframe, true, null);
